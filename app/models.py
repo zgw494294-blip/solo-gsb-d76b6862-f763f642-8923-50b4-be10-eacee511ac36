@@ -262,6 +262,66 @@ class PreviewRequest(StrictModel):
     conditions: dict[str, dict[str, object]] = Field(default_factory=dict)
 
 
+class GraphRegisterRequest(ReviewRequest):
+    """A whole, self-contained graph registered for later registry-driven review.
+
+    The shape is identical to :class:`ReviewRequest` (``nodes`` + ``export``)
+    and the whole graph is validated by exactly the same rules at registration
+    time and on every registry replacement afterwards.
+    """
+
+
+class GraphPreviewRequest(StrictModel):
+    """A preview of a previously registered graph: sample inputs only.
+
+    The graph itself is referenced by its registered id (in the URL); the body
+    carries just ``rows`` and ``conditions``, with the same shapes and rules as
+    :class:`PreviewRequest`. Coverage is still checked against the stored
+    graph's closure, so a wrong structural type or missing rows stays a 422.
+    """
+
+    rows: dict[str, list[dict[str, object]]]
+    conditions: dict[str, dict[str, object]] = Field(default_factory=dict)
+
+
+class SensitiveColumnEntryIn(StrictModel):
+    """One shared sensitive-column entry, identified by source id and column.
+
+    Entries are global: they need not name a source any registered graph
+    declares. ``source`` is non-empty; ``column`` is non-empty; two entries
+    equal on both fields are duplicates and rejected at the schema level.
+    """
+
+    source: str = Field(min_length=1)
+    column: str = Field(min_length=1)
+
+
+class SensitiveColumnsReplaceRequest(StrictModel):
+    """Whole-list replacement of the shared sensitive-column registry.
+
+    ``entries`` replaces the registry wholesale (an empty list clears it) and
+    ``expected_generation`` must equal the current generation; a stale value
+    rejects the request as HTTP 409 without changing anything. On success the
+    generation advances by one and every registered graph is re-reviewed.
+    """
+
+    entries: list[SensitiveColumnEntryIn] = Field(default_factory=list)
+    expected_generation: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _entries_distinct(self) -> "SensitiveColumnsReplaceRequest":
+        seen: set[tuple[str, str]] = set()
+        for item in self.entries:
+            key = (item.source, item.column)
+            if key in seen:
+                raise ValueError(
+                    f"sensitive-column entry '{item.source}/{item.column}' is "
+                    "listed more than once"
+                )
+            seen.add(key)
+        return self
+
+
 class PruneRequest(StrictModel):
     """A review request plus the export columns the caller wants to keep.
 

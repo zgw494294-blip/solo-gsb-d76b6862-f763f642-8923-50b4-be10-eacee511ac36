@@ -172,11 +172,17 @@ def topological_order(by_id: dict[str, object]) -> list[str]:
     return order
 
 
-def _eval_source(node: SourceNodeIn) -> Relation:
+def _eval_source(
+    node: SourceNodeIn, extra_sensitive: frozenset[Origin]
+) -> Relation:
     columns = [
         Column(
             col.name,
-            frozenset({(node.id, col.name)}) if col.sensitive else frozenset(),
+            # Effective sensitivity is the in-graph flag OR membership in the
+            # shared sensitive-column registry; both root at the same origin.
+            frozenset({(node.id, col.name)})
+            if col.sensitive or (node.id, col.name) in extra_sensitive
+            else frozenset(),
         )
         for col in node.columns
     ]
@@ -307,8 +313,16 @@ def _evaluate_graph(
     request: Union[
         ReviewRequest, ReviseRequest, PruneRequest, RenameRequest, PreviewRequest
     ],
+    extra_sensitive: frozenset[Origin] = frozenset(),
 ) -> tuple[dict[str, object], list[str], dict[str, Relation]]:
     """Run every original validation rule and evaluate all relations.
+
+    ``extra_sensitive`` holds shared sensitive-column registry entries
+    identified by ``(source node id, column name)``; the listed source columns
+    are treated as sensitive *in addition to* every in-graph ``sensitive``
+    flag (an OR). Entries naming unknown sources or columns are simply inert:
+    a registered graph mentioning neither is unaffected, and a registry entry
+    for a source the graph does not declare cannot influence anything.
 
     Returns the node index, topological order and per-node relations. Raises
     :class:`ValidationError` exactly as ``review`` always has.
@@ -330,7 +344,7 @@ def _evaluate_graph(
     for nid in order:
         node = by_id[nid]
         if isinstance(node, SourceNodeIn):
-            relations[nid] = _eval_source(node)
+            relations[nid] = _eval_source(node, extra_sensitive)
         elif isinstance(node, ProjectionNodeIn):
             relations[nid] = _eval_projection(node, relations[node.input])
         elif isinstance(node, FilterNodeIn):
@@ -370,8 +384,11 @@ def _review_export(
     }
 
 
-def review(request: ReviewRequest) -> dict[str, object]:
-    _by_id, _order, relations = _evaluate_graph(request)
+def review(
+    request: ReviewRequest,
+    extra_sensitive: frozenset[Origin] = frozenset(),
+) -> dict[str, object]:
+    _by_id, _order, relations = _evaluate_graph(request, extra_sensitive)
     return _review_export(request.export, relations)
 
 
@@ -1340,7 +1357,10 @@ def _reject_non_scalar_preview_constants(by_id: dict[str, object]) -> None:
                     )
 
 
-def preview(request: PreviewRequest) -> dict[str, object]:
+def preview(
+    request: PreviewRequest,
+    extra_sensitive: frozenset[Origin] = frozenset(),
+) -> dict[str, object]:
     """Run a small-sample dry run of the export over caller-supplied rows.
 
     The whole graph is validated under exactly the same rules as
@@ -1364,8 +1384,12 @@ def preview(request: PreviewRequest) -> dict[str, object]:
     and intermediate relation must stay within :data:`PREVIEW_ROW_LIMIT` rows;
     any overflow or malformed input rejects the whole request without partial
     data.
+
+    ``extra_sensitive`` is the shared sensitive-column registry: its entries
+    add to the graph's in-graph ``sensitive`` flags before validation, so a
+    preview stays blocked whenever either source of sensitivity applies.
     """
-    by_id, order, relations = _evaluate_graph(request)
+    by_id, order, relations = _evaluate_graph(request, extra_sensitive)
 
     # --- closure: export plus its dependency ancestors ----------------------
     keep = _ancestors(request.export, by_id)
