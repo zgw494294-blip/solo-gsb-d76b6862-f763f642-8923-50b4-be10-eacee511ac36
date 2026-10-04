@@ -5,9 +5,18 @@ services:
     container_name: export-risk-review
     ports:
       - "8080:8080"
+    environment:
+      # Registered graphs, the sensitive-column roster and its generation live
+      # in this SQLite file, which is kept on the named volume below.
+      EXPORT_RISK_DB: /data/export-risk.db
+    volumes:
+      - export-risk-data:/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
       interval: 10s
       timeout: 3s
       retries: 5
+
+volumes:
+  export-risk-data:

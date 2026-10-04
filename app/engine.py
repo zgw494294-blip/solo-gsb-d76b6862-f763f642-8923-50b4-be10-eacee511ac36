@@ -375,6 +375,47 @@ def review(request: ReviewRequest) -> dict[str, object]:
     return _review_export(request.export, relations)
 
 
+def apply_roster(
+    nodes: list[dict[str, object]], roster: frozenset[Origin]
+) -> list[dict[str, object]]:
+    """Return graph node dicts whose source ``sensitive`` flags OR the roster.
+
+    The shared sensitive-column roster marks ``(source node id, column)``
+    pairs sensitive independently of the graph's own flags. A source column is
+    effective-sensitive when the graph marks it ``sensitive: true`` *or* the
+    roster names it. Every other node is copied through untouched; the input
+    list is never mutated.
+    """
+    out: list[dict[str, object]] = []
+    for node in nodes:
+        if node.get("type") != "source":
+            out.append(node)
+            continue
+        updated = dict(node)
+        updated["columns"] = [
+            (
+                dict(column, sensitive=True)
+                if bool(column.get("sensitive"))
+                or (node["id"], column["name"]) in roster
+                else dict(column, sensitive=False)
+            )
+            for column in node["columns"]
+        ]
+        out.append(updated)
+    return out
+
+
+def review_with_roster(
+    nodes: list[dict[str, object]], export: str, roster: frozenset[Origin]
+) -> dict[str, object]:
+    """Validate the whole graph under the original rules, then review it with
+    the effective sensitivity (graph flags OR the shared roster)."""
+    effective = ReviewRequest.model_validate(
+        {"nodes": apply_roster(nodes, roster), "export": export}
+    )
+    return review(effective)
+
+
 def serialize_node(node: object) -> dict[str, object]:
     """Dump a validated node back into request-compatible JSON.
 

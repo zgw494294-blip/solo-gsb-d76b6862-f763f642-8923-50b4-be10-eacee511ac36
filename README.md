@@ -34,6 +34,13 @@
 分别给出内容、行影响两类原因的新增与消失，并标出候选版是否引入新的导出风险（`regression`）；
 同一来源从内容影响转为筛选行影响也算新增行影响，即使两版该列都阻断，详见下文“两版导出风险对照”。
 
+此外，服务支持把加工图**登记入库**（SQLite 持久化、重启可用）：登记时沿用整图校验并返回**图 ID**；
+另有一份全局共享的**敏感列名录**——按 `(源节点 ID, 列名)` 标识，初始为空、代次 `generation` 为 0。
+图内 `sensitive` 标记与名录取 **OR**；名录整份替换须携带**期望代次**（过期返回 409），成功代次加一、
+**重审全部登记图**，名录、代次与全部审查结论在同一事务里保存（失败一概不变）。按图 ID 的预演只提交
+`rows`、`conditions`，阻断沿用 `400 / PREVIEW_BLOCKED` 且不返回数据，成功返回当前代次。名录替换与
+登记、读取、预演在服务内按同一个先后次序串行生效，详见下文“登记加工图与共享敏感列名录”。
+
 ## 风险传播规则
 
 | 节点 | 行为 | 内容影响 | 行影响 |
@@ -72,6 +79,10 @@ schema 问题判为 422。
 ## 单条命令启动
 
 > 端口：**8080**
+>
+> 登记的加工图、共享敏感列名录、代次与审查结论保存在容器内 `/data/export-risk.db`（SQLite），
+> 由 Compose 命名卷 `export-risk-data` 持久化：容器或服务重启（含 `docker compose down` 后重新
+> `up --build`）后仍然可用。
 
 ```bash
 docker compose up --build
@@ -96,6 +107,9 @@ curl http://localhost:8080/health
 pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8080
 ```
+
+此时登记数据默认写入工作目录下的 `data/export-risk.db`，可用环境变量
+`EXPORT_RISK_DB=/path/to/risk.db` 改变位置（重启同一文件即恢复全部状态）。
 
 ## HTTP 调用示例
 
@@ -1100,6 +1114,177 @@ curl -s -i -X POST http://localhost:8080/api/compare \
 # HTTP/1.1 400 ... {"error":{"code":"INVALID_REFERENCE", ...
 ```
 
+## 登记加工图与共享敏感列名录
+
+除无状态的旧接口外，服务还把加工图**登记**到 SQLite 数据库中（默认文件 `/data/export-risk.db`，
+由 Compose 命名卷 `export-risk-data` 持久化，**重启后图、名录、代次与审查结论仍在**），并维护一份
+全局共享的**敏感列名录**。
+
+### 名录与代次
+
+* 名录条目形如 `{"source_id": "源节点 ID", "column": "列名"}`，以 **(源 ID, 列名)** 为唯一标识，
+  条目必须互异（重复为 schema 错误，返回 422）；**可以指向未在任何图中登记的来源**（暂无作用，
+  以后登记匹配来源的图时生效）。
+* 名录**初始为空，`generation` 为 `0`**。
+* 某源列是否按敏感处理：**图内 `sensitive: true` 与名录取 OR**——任一为真即敏感。名录不会改写登记
+  的原图，读取图时返回的仍是原始 `sensitive` 标记与当前审查结论。
+* `PUT /api/sensitive-roster` 为**整份替换**：请求体 `{"expected_generation": <当前代次>, "entries": [...]}`，
+  `entries` 可为空数组（即清空名录）。期望代次与当前不一致时返回 **HTTP 409 `ROSTER_GENERATION_CONFLICT`**
+  （响应附 `expected_generation` / `current_generation`）且**不改变任何状态**。
+* 替换成功：`generation` **加一**，并以**当前名录重审全部已登记图**；名录、新代次与每张图的新审查结论
+  在**同一 SQLite 事务**中提交，任何失败都整体回滚（名录、代次、结论保持替换前状态）。
+
+### 新接口
+
+| 方法与路径 | 作用 |
+|---|---|
+| `POST /api/graphs` | 登记一张完整加工图（请求体与 `/api/review` 完全同构，**沿用整图校验**：重复 ID、列名冲突、无效引用、环等同样以 400 拒绝，schema 问题 422）。成功返回 **201** 与 `graph_id`、原图 `nodes`、`export`、当前 `generation` 与按“图标记 OR 名录”得出的 `review` |
+| `GET /api/graphs/{graph_id}` | 返回**原图** `nodes`/`export`、**当前 `generation`** 与**当前审查结果** `review`；未知 ID 返回 **404 `GRAPH_NOT_FOUND`** |
+| `POST /api/graphs/{graph_id}/preview` | 按图 ID 预演，请求体**只含 `rows` 与 `conditions`**（同 `/api/preview` 的语义与全部校验：覆盖、键集合、标量、200 行上限等）；**阻断沿用 `400 / PREVIEW_BLOCKED` 且错误体不含任何样本数据**，成功返回 `columns`/`rows`、当前审查 `review` 与当前 `generation`；未知 ID 为 **404** |
+| `GET /api/sensitive-roster` | 读取当前名录与 `generation`（条目按 `(source_id, column)` 排序） |
+| `PUT /api/sensitive-roster` | 整份替换名录（见上），成功返回新 `generation`、新 `entries` 与本次重审的 `reviewed_graphs` 数 |
+
+**并发次序**：名录替换与登记、读取、预演在服务内共用同一把锁与 SQLite 事务，按某一个确定的先后次序
+整体生效——读取/预演在同一次调用里看到的名录代次与审查结论必然来自同一个已提交状态：既不会用**新名录
+配旧结论**，也不会在名录替换提交后仍凭**旧的安全结论**放行预演。
+
+**旧接口不受名录影响**：`/api/review`、`/api/preview`（以及 revise/prune/rename/compose/compare）仍然
+**只按图内 `sensitive` 标记**审查；名录与已登记图只作用于上面的新接口。
+
+> 不用 Docker 时数据库文件默认放在工作目录的 `data/export-risk.db`（已加入 `.gitignore`），也可用环境
+> 变量 `EXPORT_RISK_DB` 指定其他路径。
+
+### 登记 → 标敏感后预演被拒 → 清空后恢复（可直接执行）
+
+以下命令依次演示：登记一张**图内没有任何敏感标记**的加工图、安全预演返回样本、把共享名录标上
+`users.email` 后预演被 `400/PREVIEW_BLOCKED` 拒绝（不返回数据）、清空名录后预演恢复。
+
+```bash
+# 0) 查看名录：初始为空、generation 为 0
+curl -s http://localhost:8080/api/sensitive-roster
+# {"generation":0,"entries":[]}
+
+# 1) 登记加工图（沿用整图校验；返回图 ID 与按“图标记 OR 名录”的审查结论）
+#    需要 jq 来记下返回的图 ID；无 jq 时手动复制响应里的 graph_id
+GID=$(curl -s -X POST http://localhost:8080/api/graphs \
+  -H 'Content-Type: application/json' \
+  --data @examples/register_request.json | tee /tmp/register.json | jq -r .graph_id)
+cat /tmp/register.json
+echo "GID=$GID"
+```
+
+```jsonc
+// /tmp/register.json（图内无敏感标记、名录为空，审查通过）
+{
+  "graph_id": "a6be64369875411a8cb9b1068b9fdf9a",
+  "export": "export_users",
+  "generation": 0,
+  "review": {"export": "export_users", "blocked": false, "columns": [ ... ]},
+  "nodes": [ ...原图，sensitive 标记原样... ]
+}
+```
+
+```bash
+# 2) 按图 ID 预演：只提交 rows、conditions；审查通过，返回样本数据与当前代次
+curl -s -X POST "http://localhost:8080/api/graphs/$GID/preview" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "rows": {"users": [
+      {"uid": 1, "email": "a@x.example", "country": "CN"},
+      {"uid": 2, "email": "b@x.example", "country": "US"}
+    ]},
+    "conditions": {"only_cn": {"country": "CN"}}
+  }'
+```
+
+```json
+{
+  "export": "export_users",
+  "columns": ["user_id", "mail", "bucket"],
+  "rows": [[1, "a@x.example", "ALL"]],
+  "review": {"export": "export_users", "blocked": false, "columns": [ ... ]},
+  "generation": 0
+}
+```
+
+```bash
+# 3) 读取图：返回原图、当前 generation 与审查结果
+curl -s "http://localhost:8080/api/graphs/$GID" | jq '{export, generation, blocked: .review.blocked}'
+# {"export":"export_users","generation":0,"blocked":false}
+
+# 4) 整份替换名录：把 (users, email) 标为共享敏感列，携带期望代次 0
+curl -s -X PUT http://localhost:8080/api/sensitive-roster \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_generation": 0, "entries": [{"source_id": "users", "column": "email"}]}'
+# {"generation":1,
+#  "entries":[{"source_id":"users","column":"email"}],
+#  "reviewed_graphs":1}
+
+# 期望代次过期（仍传 0）时返回 409，状态不变
+curl -s -i -X PUT http://localhost:8080/api/sensitive-roster \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_generation": 0, "entries": []}'
+# HTTP/1.1 409 ... {"error":{"code":"ROSTER_GENERATION_CONFLICT",
+#   "expected_generation":0,"current_generation":1, ...}}
+
+# 5) 再次预演：当前结论已阻断 -> 400 / PREVIEW_BLOCKED，错误体中没有任何样本数据
+curl -s -i -X POST "http://localhost:8080/api/graphs/$GID/preview" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "rows": {"users": [{"uid": 1, "email": "a@x.example", "country": "CN"}]},
+    "conditions": {"only_cn": {"country": "CN"}}
+  }'
+# HTTP/1.1 400 ...
+# {"error":{"code":"PREVIEW_BLOCKED","node_id":"export_users",
+#   "review":{"export":"export_users","blocked":true,"columns":[
+#     {"name":"user_id","blocked":false,"content_reasons":[],"row_reasons":[]},
+#     {"name":"mail","blocked":true,
+#      "content_reasons":[{"node_id":"users","column":"email"}],"row_reasons":[]},
+#     {"name":"bucket","blocked":false,"content_reasons":[],"row_reasons":[]}]}}}
+# 错误体不含 columns/rows —— 不泄露任何样本数据。
+
+# 读取图同样看到当前代次 1 与阻断结论（原图 nodes 仍是 sensitive: false）
+curl -s "http://localhost:8080/api/graphs/$GID" | jq '{export, generation, blocked: .review.blocked}'
+# {"export":"export_users","generation":1,"blocked":true}
+
+# 6) 清空名录（携带当前代次 1；代次加一为 2，全部登记图重审恢复安全）
+curl -s -X PUT http://localhost:8080/api/sensitive-roster \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_generation": 1, "entries": []}'
+# {"generation":2,"entries":[],"reviewed_graphs":1}
+
+# 7) 预演恢复：返回样本数据，generation 为 2
+curl -s -X POST "http://localhost:8080/api/graphs/$GID/preview" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "rows": {"users": [{"uid": 1, "email": "a@x.example", "country": "CN"}]},
+    "conditions": {"only_cn": {"country": "CN"}}
+  }' | jq '{rows, generation, blocked: .review.blocked}'
+# {"rows":[[1,"a@x.example","ALL"]],"generation":2,"blocked":false}
+```
+
+图 ID 写错时读取与预演均返回 404：
+
+```bash
+curl -s -i http://localhost:8080/api/graphs/does-not-exist
+# HTTP/1.1 404 ... {"error":{"code":"GRAPH_NOT_FOUND","graph_id":"does-not-exist", ...}}
+```
+
+名录也可以指向**尚未登记的来源**（`POST /api/graphs` 登记匹配来源的图时即生效）；条目只影响**源列的
+敏感性**，其余传播规则（投影继承/清除、筛选行影响、连接键行影响）完全不变。旧接口 `/api/review` 与
+`/api/preview` 在名录非空时仍只按图内标记审查：
+
+```bash
+# 名录里仍有 users.email 时，旧 /api/review 结论不受影响
+curl -s -X POST http://localhost:8080/api/review \
+  -H 'Content-Type: application/json' \
+  --data @examples/register_request.json | jq '.blocked'
+# false
+```
+
+持久化在 Docker 部署中由 Compose 命名卷提供（`docker compose down` 后再 `up --build`，已登记图、
+名录、代次与结论仍可读取）；本地运行时数据位于 `EXPORT_RISK_DB`（默认 `data/export-risk.db`）。
+
 ## 节点 JSON 结构
 
 ```jsonc
@@ -1135,11 +1320,12 @@ python -m pytest tests/ -q
 ## 文件说明
 
 ```
-app/models.py     请求模型与结构约束（Pydantic；含 ReviseRequest、PruneRequest、RenameRequest、ComposeRequest、PreviewRequest 与 CompareRequest）
-app/engine.py     图校验、拓扑排序、来源传播、逐列审查、安全修订、按列精简、源列批量改名、上下游拼接、小样本预演与两版导出风险对照
-app/main.py       FastAPI 入口（/api/review、/api/revise、/api/prune、/api/rename、/api/compose、/api/preview、/api/compare、/health）
-examples/         请求示例（request.json、revise_request.json、prune_request.json、rename_request.json、compose_request.json、preview_request.json、compare_request.json）
-tests/            传播规则、拒绝场景、修订/复审、精简、改名、拼接、预演与两版对照测试
+app/models.py     请求模型与结构约束（Pydantic；含 ReviseRequest、PruneRequest、RenameRequest、ComposeRequest、PreviewRequest、CompareRequest 与 RosterReplaceRequest、GraphPreviewRequest）
+app/engine.py     图校验、拓扑排序、来源传播、逐列审查、安全修订、按列精简、源列批量改名、上下游拼接、小样本预演、两版导出风险对照与名录 OR 复审
+app/storage.py    SQLite 持久化：登记图、共享敏感列名录与代次、按图读取/预演、名录整份替换并重审全部登记图（单锁 + 事务，并发按同一先后次序生效）
+app/main.py       FastAPI 入口（/api/review、/api/revise、/api/prune、/api/rename、/api/compose、/api/preview、/api/compare、/api/graphs、/api/sensitive-roster、/health）
+examples/         请求示例（request.json、revise_request.json、prune_request.json、rename_request.json、compose_request.json、preview_request.json、compare_request.json、register_request.json）
+tests/            传播规则、拒绝场景、修订/复审、精简、改名、拼接、预演、两版对照及登记/名录/持久化/并发测试
 Dockerfile        容器镜像（python:3.11-slim，暴露 8080）
-docker-compose.yml 单命令编排
+docker-compose.yml 单命令编排（命名卷 export-risk-data 持久化 /data/export-risk.db）
 ```

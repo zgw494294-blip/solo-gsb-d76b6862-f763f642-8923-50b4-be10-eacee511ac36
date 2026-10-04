@@ -286,3 +286,55 @@ class PruneRequest(StrictModel):
                 )
             seen.add(name)
         return self
+
+
+class SensitiveColumnEntryIn(StrictModel):
+    """One shared-roster entry: a sensitive column identified by source + name.
+
+    The named source does not have to belong to any registered graph; roster
+    entries about unknown sources are simply inert until a matching graph is
+    registered. Pair identity is ``(source_id, column)``.
+    """
+
+    source_id: str = Field(min_length=1)
+    column: str = Field(min_length=1)
+
+
+class RosterReplaceRequest(StrictModel):
+    """Whole-roster replacement carried with an optimistic generation check.
+
+    ``expected_generation`` must equal the roster's current generation or the
+    request is rejected with HTTP 409. On success the whole ``entries`` list
+    becomes the new roster and the generation advances by one. The list may be
+    empty (clearing the roster); duplicate ``(source_id, column)`` pairs are a
+    schema error (HTTP 422).
+    """
+
+    expected_generation: int = Field(ge=0)
+    entries: list[SensitiveColumnEntryIn]
+
+    @model_validator(mode="after")
+    def _entries_distinct(self) -> "RosterReplaceRequest":
+        seen: set[tuple[str, str]] = set()
+        for entry in self.entries:
+            key = (entry.source_id, entry.column)
+            if key in seen:
+                raise ValueError(
+                    f"roster entry for source '{entry.source_id}' column "
+                    f"'{entry.column}' is listed more than once"
+                )
+            seen.add(key)
+        return self
+
+
+class GraphPreviewRequest(StrictModel):
+    """A registered-graph preview: only sample data, never another graph.
+
+    The graph itself is addressed by the URL's graph id; the body carries just
+    ``rows`` and ``conditions`` with exactly the same shape and meaning as in
+    :class:`PreviewRequest`. Coverage, key-set, scalar and row-limit rules are
+    all re-checked by the same preview engine against the registered graph.
+    """
+
+    rows: dict[str, list[dict[str, object]]]
+    conditions: dict[str, dict[str, object]] = Field(default_factory=dict)
