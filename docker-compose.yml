@@ -1,0 +1,13 @@
+services:
+  export-risk-api:
+    build: .
+    image: export-risk-review:latest
+    container_name: export-risk-review
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
